@@ -896,6 +896,19 @@ class GPUModelRunner(
         self.valid_sampled_token_count_cpu: torch.Tensor | None = None
         self.draft_token_ids_cpu: torch.Tensor | None = None
         self.num_accepted_tokens_event: torch.Event | None = None
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.skip_unused_accepted_tokens_cpu
+            and (
+                not self.model_config.is_hybrid
+                or not self.use_async_spec_decode
+                or self.cache_config.mamba_cache_mode != "none"
+            )
+        ):
+            logger.warning(
+                "skip_unused_accepted_tokens_cpu has no effect: requires "
+                "async hybrid speculative decoding with mamba_cache_mode=none"
+            )
         if self.num_spec_tokens:
             self.draft_token_ids_event = torch.Event()
             self.num_accepted_tokens_event = torch.Event()
@@ -1538,6 +1551,15 @@ class GPUModelRunner(
         # tokens gives us the first -1 position (i.e., number of accepted).
         num_reqs = output_token_ids.size(0)
         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
+
+        if (
+            self.speculative_config.skip_unused_accepted_tokens_cpu
+            and self.use_async_spec_decode
+            and self.cache_config.mamba_cache_mode == "none"
+        ):
+            # _prepare_inputs defaults counts to one, then applies GPU
+            # sampled-count corrections. Align/all retain CPU state updates.
+            return
 
         if self.cache_config.mamba_cache_mode == "align":
             # Fused GPU postprocess: state copies + per-request accepted-token
@@ -6677,6 +6699,22 @@ class GPUModelRunner(
                     cudagraph_runtime_mode=runtime_mode,
                 )
                 torch.accelerator.synchronize()
+
+            if (
+                isinstance(self.drafter, EagleProposer)
+                and self.speculative_config is not None
+                and self.speculative_config.full_draft_cudagraph
+            ):
+                if (
+                    not 0
+                    <= self.drafter.kv_cache_gid
+                    < len(self.input_batch.block_table.block_tables)
+                ):
+                    raise ValueError("Full MTP graphs require an initialized KV group")
+                block_table = self.input_batch.block_table[self.drafter.kv_cache_gid]
+                self.drafter.capture_full_draft_graphs(
+                    block_table.max_num_blocks_per_req
+                )
 
             # Capture encoder CUDA graphs if enabled
             if self.encoder_cudagraph_manager is not None:

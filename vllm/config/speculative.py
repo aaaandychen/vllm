@@ -142,6 +142,14 @@ class SpeculativeConfig:
     O(2 * tp_size) per token. Only applies to greedy draft selection in
     non-tree speculation."""
 
+    full_draft_cudagraph: bool = False
+    """Capture Qwen3.5 MTP forward passes with Triton attention as full
+    CUDA graphs on the V1 runner. Uniform first and subsequent passes are
+    captured separately; other shapes retain the existing execution path."""
+    skip_unused_accepted_tokens_cpu: bool = False
+    """Skip the accepted-count CPU copy for asynchronous hybrid decoding
+    without Mamba prefix caching. Align/all cache modes retain their copies."""
+
     use_heterogeneous_vocab: bool = False
     """Allow draft and target models to use different vocabularies.
     When enabled, builds a token-level intersection at init and constrains

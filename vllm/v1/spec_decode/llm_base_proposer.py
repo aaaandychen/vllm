@@ -17,6 +17,7 @@ from vllm.config import (
 )
 
 if TYPE_CHECKING:
+    from vllm.v1.spec_decode.mtp_cudagraph import MTPForwardCUDAGraph
     from vllm.v1.spec_decode.vocab_mapping import VocabMapping
 
 from vllm.distributed.eplb.eplb_state import EplbState
@@ -162,6 +163,7 @@ class SpecDecodeBaseProposer:
         # gpu_model_runner._check_and_update_cudagraph_mode after
         # adjust_cudagraph_sizes_for_spec_decode is called.
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
+        self.full_draft_graph: MTPForwardCUDAGraph | None = None
 
         # persistent buffers for cuda graph
         self.input_ids = torch.zeros(
@@ -425,6 +427,39 @@ class SpecDecodeBaseProposer:
 
         self.cudagraph_dispatcher.initialize_cudagraph_keys(eagle_cudagraph_mode)
 
+    def capture_full_draft_graphs(self, block_table_width: int) -> None:
+        if not self.speculative_config.full_draft_cudagraph:
+            return
+        config = self.vllm_config
+        if (
+            config.model_config.hf_text_config.model_type != "qwen3_5_moe_text"
+            or self.method != "mtp"
+            or self.speculative_config.enforce_eager
+            or config.model_config.enforce_eager
+            or config.lora_config is not None
+            or config.parallel_config.data_parallel_size != 1
+            or config.parallel_config.pipeline_parallel_size != 1
+            or config.parallel_config.enable_eplb
+            or config.parallel_config.enable_dbo
+            or config.parallel_config.decode_context_parallel_size != 1
+            or config.parallel_config.prefill_context_parallel_size != 1
+            or self.parallel_drafting
+            or not current_platform.is_cuda()
+            or (
+                config.model_config.multimodal_config is not None
+                and not config.model_config.multimodal_config.language_model_only
+            )
+        ):
+            raise ValueError(
+                "full_draft_cudagraph supports Qwen3.5 MoE MTP with TP only, "
+                "in text-only CUDA mode without eager mode, LoRA, EPLB, DBO, "
+                "context parallelism or parallel drafting"
+            )
+        from vllm.v1.spec_decode.mtp_cudagraph import MTPForwardCUDAGraph
+
+        self.full_draft_graph = MTPForwardCUDAGraph(self)
+        self.full_draft_graph.capture(block_table_width)
+
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""
         if self.use_local_argmax_reduction:
@@ -587,7 +622,13 @@ class SpecDecodeBaseProposer:
                 slot_mapping_size, common_attn_metadata.slot_mapping
             ),
         ):
-            ret_hidden_states = self.model(**model_kwargs)
+            ret_hidden_states = None
+            if self.full_draft_graph is not None:
+                ret_hidden_states = self.full_draft_graph.replay(
+                    common_attn_metadata, per_layer_attn_metadata, num_input_tokens
+                )
+            if ret_hidden_states is None:
+                ret_hidden_states = self.model(**model_kwargs)
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
@@ -744,7 +785,13 @@ class SpecDecodeBaseProposer:
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=self._get_slot_mapping(input_batch_size),
             ):
-                ret_hidden_states = self.model(**model_kwargs)
+                ret_hidden_states = None
+                if self.full_draft_graph is not None:
+                    ret_hidden_states = self.full_draft_graph.replay(
+                        common_attn_metadata, per_layer_attn_metadata, input_batch_size
+                    )
+                if ret_hidden_states is None:
+                    ret_hidden_states = self.model(**model_kwargs)
                 if not self.model_returns_tuple():
                     last_hidden_states = ret_hidden_states
                     hidden_states = ret_hidden_states
