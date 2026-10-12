@@ -35,6 +35,7 @@ from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
 from .interfaces import (
     MultiModalEmbeddings,
     SupportsMultiModal,
+    SupportsPP,
     _require_is_multimodal,
 )
 from .utils import (
@@ -43,6 +44,7 @@ from .utils import (
     WeightsMapper,
     _merge_multimodal_embeddings,
     make_empty_intermediate_tensors_factory,
+    make_layers,
     maybe_prefix,
 )
 
@@ -102,13 +104,12 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             prefix=f"{prefix}.fc",
         )
 
-        self.layers = torch.nn.ModuleList(
-            Qwen3_5DecoderLayer(
-                vllm_config,
-                layer_type="full_attention",
-                prefix=f"{prefix}.layers.{idx}",
-            )
-            for idx in range(self.num_mtp_layers)
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            self.num_mtp_layers,
+            lambda prefix: Qwen3_5DecoderLayer(
+                vllm_config, layer_type="full_attention", prefix=prefix
+            ),
+            prefix=f"{prefix}.layers",
         )
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
@@ -150,11 +151,12 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             residual = intermediate_tensors["residual"]
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
-        hidden_states, residual = self.layers[current_step_idx](
-            positions=positions,
-            hidden_states=hidden_states,
-            residual=residual,
-        )
+        if self.start_layer <= current_step_idx < self.end_layer:
+            hidden_states, residual = self.layers[current_step_idx](
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -189,7 +191,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         "hidden_states": 0,
     }
 )
-class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
+class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -215,6 +217,9 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
         self.config = config
         self.model = Qwen3_5MultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
+        )
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
         )
 
         if get_pp_group().is_last_rank:

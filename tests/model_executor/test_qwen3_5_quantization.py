@@ -76,3 +76,10 @@ def test_qwen3_5_mtp_lm_head_receives_quant_config():
         MockLMHead.assert_called_once()
         call_kwargs = MockLMHead.call_args.kwargs
         assert call_kwargs["quant_config"] is mock_quant_config
+
+
+def test_qwen3_5_mtp_supports_pipeline_parallel():
+    from vllm.model_executor.models.interfaces import supports_pp
+    from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MTP
+
+    assert supports_pp(Qwen3_5MTP)
